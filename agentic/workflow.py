@@ -1,5 +1,6 @@
 from typing import Annotated, Sequence, TypedDict, Optional, Dict, Any
 import os
+import json
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
@@ -19,6 +20,7 @@ from agentic.agents import (
     create_ticket_tools,
 )
 from agentic.logger import log_event
+from agentic.tools import escalate_ticket, update_ticket_status
 
 load_dotenv()
 
@@ -28,10 +30,14 @@ class AgentState(TypedDict):
     ticket_metadata: Optional[Dict[str, Any]]
 
 # 2. Specialist Tools Registration
-support_tools = create_support_tools()
+support_tools = create_support_tools() + [escalate_ticket]
 account_tools = create_account_tools()
 ticket_tools = create_ticket_tools()
-all_tools = support_tools + account_tools + ticket_tools
+
+all_tools = []
+for t in support_tools + account_tools + ticket_tools:
+    if t not in all_tools:
+        all_tools.append(t)
 
 # 3. Models bound with respective tools
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_KEY") or "sk-dummy-key-for-init"
@@ -83,15 +89,10 @@ def classify_ticket(message_text: str, metadata: Optional[Dict[str, Any]] = None
 
 # 5. Agent Executable Node Functions
 def supervisor_agent_node(state: AgentState):
-    """Supervisor Agent: inspects request, formats system prompt, and executes supervisor model."""
-    messages = state["messages"]
+    """Supervisor Agent Node: entry point that logs execution."""
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
     log_event(ticket_id=ticket_id, event_type="AGENT_EXECUTION", agent_name="supervisor_agent")
-    
-    sup_prompt = get_supervisor_agent_prompt()
-    clean_messages = [sup_prompt] + [m for m in messages if not isinstance(m, SystemMessage)]
-    response = supervisor_model.invoke(clean_messages)
-    return {"messages": [response]}
+    return {}
 
 def support_agent_node(state: AgentState):
     """Support Specialist Agent: executes KB search and policy inquiries using get_support_agent_prompt()."""
@@ -132,17 +133,8 @@ def supervisor_router(state: AgentState) -> str:
     if not messages:
         return END
     
-    last_msg = messages[-1]
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
     
-    # If supervisor produced a final AI message without tool calls, end
-    if isinstance(last_msg, AIMessage):
-        if getattr(last_msg, "tool_calls", None):
-            log_event(ticket_id=ticket_id, event_type="ROUTING", agent_name="supervisor_agent", details={"destination": "tools"})
-            return "tools"
-        log_event(ticket_id=ticket_id, event_type="RESOLUTION", agent_name="supervisor_agent", details={"status": "resolved"})
-        return END
-
     # Extract latest human message and state metadata for classification
     user_text = ""
     for m in reversed(messages):
@@ -184,11 +176,13 @@ def specialist_router(state: AgentState) -> str:
             )
         return "tools"
     
+    # Update ticket status in Udahub DB to resolved and log final status
+    update_ticket_status.invoke({"ticket_id": ticket_id, "status": "resolved"})
     log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "resolved"})
     return END
 
 def tool_router(state: AgentState) -> str:
-    """Routes tool response back to the appropriate agent or END."""
+    """Routes tool response back to the appropriate agent or handles automatic escalation handoff."""
     messages = state.get("messages", [])
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
     if not messages:
@@ -196,15 +190,51 @@ def tool_router(state: AgentState) -> str:
     last_msg = messages[-1]
     if isinstance(last_msg, ToolMessage):
         tool_name = getattr(last_msg, "name", "") or ""
-        content = last_msg.content
-        outcome = "error" if "error" in str(content).lower() else "success"
+        content_str = str(last_msg.content)
+        
+        # Check for RAG knowledge retrieval outcomes
+        if tool_name == "search_knowledge_base":
+            if '"should_escalate": true' in content_str.lower() or "'should_escalate': true" in content_str.lower():
+                log_event(
+                    ticket_id=ticket_id,
+                    event_type="RETRIEVAL_MISS",
+                    tool_name=tool_name,
+                    outcome="miss",
+                    details={"reason": "Low knowledge confidence score."}
+                )
+                # Automatic Escalation Handoff
+                esc_res = escalate_ticket.invoke({
+                    "ticket_id": ticket_id,
+                    "reason": "Low knowledge confidence score (no matching article found above threshold)."
+                })
+                log_event(
+                    ticket_id=ticket_id,
+                    event_type="ESCALATION",
+                    tool_name="escalate_ticket",
+                    outcome="escalated",
+                    details=esc_res
+                )
+                return END
+            else:
+                log_event(
+                    ticket_id=ticket_id,
+                    event_type="RETRIEVAL_SUCCESS",
+                    tool_name=tool_name,
+                    outcome="success",
+                    details={"content_preview": content_str[:200]}
+                )
+                return "support_agent"
+
+        # Log other tool outcomes
+        outcome = "error" if "error" in content_str.lower() else "success"
         log_event(
             ticket_id=ticket_id,
             event_type="TOOL_RESULT",
             tool_name=tool_name,
             outcome=outcome,
-            details={"content_preview": str(content)[:200]}
+            details={"content_preview": content_str[:200]}
         )
+        
         if tool_name in [t.name for t in support_tools]:
             return "support_agent"
         elif tool_name in [t.name for t in account_tools]:

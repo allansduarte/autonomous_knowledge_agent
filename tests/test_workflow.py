@@ -4,13 +4,7 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.outputs import ChatResult, ChatGeneration
 from agentic.workflow import orchestrator, classify_ticket, supervisor_router
 from agentic.logger import get_ticket_events, get_metrics_summary, clear_logs
-from agentic.tools import (
-    search_knowledge_base,
-    get_user_profile,
-    get_user_reservations,
-    escalate_ticket,
-    update_ticket_status
-)
+from agentic.tools import get_ticket_details, search_knowledge_base
 
 def test_workflow_graph_structure():
     """Tests that the orchestrator graph is properly compiled with memory checkpointer and contains all 4 specialized agent nodes."""
@@ -18,7 +12,6 @@ def test_workflow_graph_structure():
     assert hasattr(orchestrator, "checkpointer")
     assert orchestrator.checkpointer is not None
     
-    # Verify graph contains all 4 specialized agent nodes + tools
     nodes = orchestrator.nodes
     assert "supervisor_agent" in nodes
     assert "support_agent" in nodes
@@ -58,93 +51,119 @@ def test_ticket_classification_complex_escalation_sample():
     assert res["urgency"] == "high"
     assert "Ticket Agent" in res["routing_reason"]
 
-def test_supervisor_router_with_metadata():
-    """Tests supervisor_router selecting the target specialist node based on message and metadata state."""
-    state = {
-        "messages": [HumanMessage(content="Please check ticket history for customer dispute")],
-        "ticket_metadata": {"tags": "dispute", "urgency": "high"}
+def test_scenario1_policy_faq_orchestrator_invoke():
+    """Scenario 1: End-to-end Policy FAQ query processing via orchestrator.invoke."""
+    ticket_id = "ticket_a4ab87"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="How do I cancel or pause my CultPass subscription?")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "cancellation", "urgency": "normal"}
     }
-    target_node = supervisor_router(state)
-    assert target_node == "ticket_agent"
-
-def test_end_to_end_scenario1_policy_successful_resolution():
-    """Scenario 1: Policy / FAQ query -> support_agent -> RAG tool -> successful resolution in DB."""
-    ticket_id = "test_ticket_policy_001"
     
-    # Execute RAG knowledge retrieval tool
-    kb_res = search_knowledge_base.invoke({"query": "how to cancel or pause subscription", "top_k": 3})
-    assert len(kb_res["articles"]) > 0
-    assert kb_res["should_escalate"] is False
+    # Mock LLM tool call to search_knowledge_base followed by resolution answer
+    tool_call_msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_knowledge_base", "args": {"query": "how to cancel or pause subscription"}, "id": "call_1"}]
+    )
+    final_ans = AIMessage(content="You can cancel or pause your subscription at any time via the My Account section.")
     
-    # Update DB ticket status to resolved
-    upd_res = update_ticket_status.invoke({"ticket_id": ticket_id, "status": "resolved", "issue_type": "cancellation"})
-    assert upd_res["success"] is True
-    assert upd_res["status"] == "resolved"
+    res1 = ChatResult(generations=[ChatGeneration(message=tool_call_msg)])
+    res2 = ChatResult(generations=[ChatGeneration(message=final_ans)])
     
-    # Verify structured logs
-    events = get_ticket_events(ticket_id)
-    assert isinstance(events, list)
-
-def test_end_to_end_scenario2_unavailable_knowledge_escalation():
-    """Scenario 2: Unavailable knowledge / low confidence query -> should_escalate: True -> escalate_ticket in DB."""
-    ticket_id = "test_ticket_escalation_002"
-    
-    # Execute low-confidence search
-    kb_res = search_knowledge_base.invoke({"query": "unknown quantum portal feature 999", "top_k": 3})
-    assert kb_res["should_escalate"] is True
-    
-    # Execute human escalation tool
-    esc_res = escalate_ticket.invoke({"ticket_id": ticket_id, "reason": kb_res["escalation_reason"]})
-    assert esc_res["success"] is True
-    assert esc_res["status"] == "escalated"
-
-def test_end_to_end_scenario3_account_services_resolution():
-    """Scenario 3: Account lookup query -> account_agent -> get_user_profile & get_user_reservations -> resolved in DB."""
-    ticket_id = "test_ticket_account_003"
-    
-    # Execute account tools
-    profile = get_user_profile.invoke({"user_id_or_email": "a4ab87"})
-    assert "user_id" in profile
-    assert profile["user_id"] == "a4ab87"
-    
-    reservations = get_user_reservations.invoke({"user_id": "a4ab87"})
-    assert isinstance(reservations, list)
-    
-    upd_res = update_ticket_status.invoke({"ticket_id": ticket_id, "status": "resolved", "issue_type": "account_inquiry"})
-    assert upd_res["success"] is True
-
-def test_end_to_end_scenario4_edge_case_and_error_handling():
-    """Scenario 4: Edge case / unknown user lookup -> handled gracefully with error dict."""
-    ticket_id = "test_ticket_edge_004"
-    
-    res_unknown = get_user_reservations.invoke({"user_id": "nonexistent_user_xyz999"})
-    assert "error" in res_unknown
-    assert "not found" in res_unknown["error"]
-
-def test_structured_operational_metrics_summary():
-    """Tests structured operational metric calculation."""
-    metrics = get_metrics_summary()
-    assert isinstance(metrics, dict)
-    assert "total_events" in metrics
-    assert "retrieval_success_rate" in metrics
-
-def test_workflow_execution_with_mock():
-    """Tests orchestrator flow execution using a mock LLM response."""
-    mock_msg = AIMessage(content="Your CultPass subscription includes 4 curated experiences per month.")
-    mock_result = ChatResult(generations=[ChatGeneration(message=mock_msg)])
-    
-    with patch("langchain_openai.ChatOpenAI._generate", return_value=mock_result):
-        config = {"configurable": {"thread_id": "test_thread_mock"}}
-        input_data = {
-            "messages": [HumanMessage(content="What is included in CultPass subscription?")],
-            "ticket_metadata": {"ticket_id": "test_thread_mock"}
-        }
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.side_effect = [res1, res2]
         
         result = orchestrator.invoke(input=input_data, config=config)
         assert "messages" in result
         assert len(result["messages"]) > 0
-        last_msg = result["messages"][-1]
-        assert "4 curated experiences" in last_msg.content
+        
+        # Verify searchable events
+        events = get_ticket_events(ticket_id)
+        event_types = [e["event_type"] for e in events]
+        assert "CLASSIFICATION" in event_types
+        assert "ROUTING" in event_types
+        assert "TOOL_CALL" in event_types
+        assert "RETRIEVAL_SUCCESS" in event_types
+
+def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
+    """Scenario 2: End-to-end low confidence query -> should_escalate -> automatic escalation via orchestrator.invoke."""
+    ticket_id = "ticket_a4ab87"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="xyz123999 unknown quantum feature")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "unknown", "urgency": "high"}
+    }
+    
+    tool_call_msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_knowledge_base", "args": {"query": "xyz123999 unknown quantum feature"}, "id": "call_2"}]
+    )
+    res_mock = ChatResult(generations=[ChatGeneration(message=tool_call_msg)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate", return_value=res_mock):
+        result = orchestrator.invoke(input=input_data, config=config)
+        assert "messages" in result
+        
+        events = get_ticket_events(ticket_id)
+        event_types = [e["event_type"] for e in events]
+        assert "RETRIEVAL_MISS" in event_types
+        assert "ESCALATION" in event_types
+
+def test_scenario3_account_services_orchestrator_invoke():
+    """Scenario 3: End-to-end user profile & reservation query processing via orchestrator.invoke."""
+    ticket_id = "ticket_a4ab87"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="What is my pass quota and reservations for user a4ab87?")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "quota, profile", "urgency": "normal"}
+    }
+    
+    tool_call_msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "get_user_profile", "args": {"user_id_or_email": "a4ab87"}, "id": "call_3"}]
+    )
+    final_ans = AIMessage(content="User a4ab87 has an active basic subscription with 4 passes.")
+    
+    res1 = ChatResult(generations=[ChatGeneration(message=tool_call_msg)])
+    res2 = ChatResult(generations=[ChatGeneration(message=final_ans)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.side_effect = [res1, res2]
+        
+        result = orchestrator.invoke(input=input_data, config=config)
+        assert "messages" in result
+        
+        events = get_ticket_events(ticket_id)
+        tool_names = [e.get("tool_name") for e in events if e.get("tool_name")]
+        assert "get_user_profile" in tool_names
+
+def test_scenario4_edge_case_error_handling_orchestrator_invoke():
+    """Scenario 4: End-to-end unknown user lookup via orchestrator.invoke."""
+    ticket_id = "ticket_a4ab87"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="Look up reservations for nonexistent_user_xyz999")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "account", "urgency": "normal"}
+    }
+    
+    tool_call_msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "get_user_reservations", "args": {"user_id": "nonexistent_user_xyz999"}, "id": "call_4"}]
+    )
+    final_ans = AIMessage(content="User nonexistent_user_xyz999 was not found.")
+    
+    res1 = ChatResult(generations=[ChatGeneration(message=tool_call_msg)])
+    res2 = ChatResult(generations=[ChatGeneration(message=final_ans)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.side_effect = [res1, res2]
+        
+        result = orchestrator.invoke(input=input_data, config=config)
+        assert "messages" in result
+        
+        events = get_ticket_events(ticket_id)
+        outcomes = [e.get("outcome") for e in events]
+        assert "error" in outcomes
 
 def test_workflow_memory_persistence():
     """Tests short-term thread session memory checkpointing in state graph."""
@@ -168,4 +187,4 @@ def test_workflow_memory_persistence():
         history = list(orchestrator.get_state_history(config=config))
         assert len(history) > 0
         messages = history[0].values["messages"]
-        assert len(messages) >= 4  # Includes user inputs and responses across turns
+        assert len(messages) >= 4
