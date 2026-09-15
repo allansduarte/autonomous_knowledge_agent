@@ -13,13 +13,13 @@ def get_udahub_engine():
 
 def compute_similarity(query: str, title: str, tags: str, content: str) -> float:
     """Computes a TF-IDF keyword & topic matching score normalized between 0.0 and 1.0."""
-    query_terms = set(re.findall(r'\w+', query.lower()))
+    query_terms = set(re.findall(r'\w+', (query or "").lower()))
     if not query_terms:
         return 0.0
     
-    title_terms = set(re.findall(r'\w+', title.lower()))
+    title_terms = set(re.findall(r'\w+', (title or "").lower()))
     tags_terms = set(re.findall(r'\w+', (tags or "").lower()))
-    content_terms = re.findall(r'\w+', content.lower())
+    content_terms = re.findall(r'\w+', (content or "").lower())
     
     raw_score = 0.0
     for term in query_terms:
@@ -41,39 +41,51 @@ def search_knowledge_base(query: str, top_k: int = 3, min_confidence: float = 0.
     """Performs RAG search over CultPass knowledge articles in Udahub DB.
     Includes confidence scoring and explicit escalation flags if no sufficiently confident match is found.
     """
-    from data.models.udahub import Knowledge
-    engine = get_udahub_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
-    try:
-        articles = session.query(Knowledge).all()
-        scored_articles = []
-        
-        for art in articles:
-            conf = compute_similarity(query, art.title, art.tags, art.content)
-            scored_articles.append({
-                "article_id": art.article_id,
-                "title": art.title,
-                "tags": art.tags,
-                "content": art.content,
-                "confidence_score": conf
-            })
-            
-        # Sort by confidence score descending
-        scored_articles.sort(key=lambda x: x["confidence_score"], reverse=True)
-        
-        top_matches = [a for a in scored_articles if a["confidence_score"] >= min_confidence][:top_k]
-        
-        # Escalation logic: If top match is below confidence threshold, recommend escalation
-        should_escalate = len(top_matches) == 0 or (scored_articles and scored_articles[0]["confidence_score"] < min_confidence)
-        highest_confidence = scored_articles[0]["confidence_score"] if scored_articles else 0.0
-        
+    if not query or not str(query).strip():
         return {
             "query": query,
-            "highest_confidence": highest_confidence,
-            "should_escalate": should_escalate,
-            "escalation_reason": "Low knowledge confidence score (no matching article found above threshold)." if should_escalate else None,
-            "articles": top_matches if top_matches else scored_articles[:top_k]
+            "highest_confidence": 0.0,
+            "should_escalate": True,
+            "escalation_reason": "Empty search query provided.",
+            "articles": []
         }
-    finally:
-        session.close()
+        
+    from data.models.udahub import Knowledge
+    try:
+        engine = get_udahub_engine()
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        try:
+            articles = session.query(Knowledge).all()
+            scored_articles = []
+            
+            for art in articles:
+                conf = compute_similarity(query, art.title, art.tags, art.content)
+                scored_articles.append({
+                    "article_id": art.article_id,
+                    "title": art.title,
+                    "tags": art.tags,
+                    "content": art.content,
+                    "confidence_score": conf
+                })
+                
+            # Sort by confidence score descending
+            scored_articles.sort(key=lambda x: x["confidence_score"], reverse=True)
+            
+            top_matches = [a for a in scored_articles if a["confidence_score"] >= min_confidence][:top_k]
+            
+            # Escalation logic: If top match is below confidence threshold, recommend escalation
+            should_escalate = len(top_matches) == 0 or (scored_articles and scored_articles[0]["confidence_score"] < min_confidence)
+            highest_confidence = scored_articles[0]["confidence_score"] if scored_articles else 0.0
+            
+            return {
+                "query": query,
+                "highest_confidence": highest_confidence,
+                "should_escalate": should_escalate,
+                "escalation_reason": "Low knowledge confidence score (no matching article found above threshold)." if should_escalate else None,
+                "articles": top_matches if top_matches else scored_articles[:top_k]
+            }
+        finally:
+            session.close()
+    except Exception as e:
+        return {"error": f"Database error: {str(e)}"}

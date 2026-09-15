@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import patch
 from agentic.tools import (
     get_user_profile,
     get_user_reservations,
@@ -67,3 +68,32 @@ def test_get_customer_history_and_escalate_ticket():
     esc = escalate_ticket.invoke({"ticket_id": "ticket_a4ab87", "reason": "Complex billing dispute"})
     assert esc["success"] is True
     assert esc["status"] == "escalated"
+
+def test_validation_and_error_handling_empty_identifiers():
+    """Tests validation when empty user or ticket identifiers are provided."""
+    res1 = get_user_profile.invoke({"user_id_or_email": ""})
+    assert "error" in res1
+    assert "cannot be empty" in res1["error"]
+    
+    res2 = get_user_reservations.invoke({"user_id": "   "})
+    assert "error" in res2
+    assert "cannot be empty" in res2["error"]
+
+    res3 = get_ticket_details.invoke({"ticket_id": ""})
+    assert "error" in res3
+    assert "cannot be empty" in res3["error"]
+
+def test_unknown_account_vs_empty_reservations():
+    """Tests distinguishing unknown accounts from valid accounts with zero reservations."""
+    # Non-existent user
+    res_unknown = get_user_reservations.invoke({"user_id": "nonexistent_user_999"})
+    assert isinstance(res_unknown, dict)
+    assert "error" in res_unknown
+    assert "not found" in res_unknown["error"]
+
+def test_database_exception_handling():
+    """Tests catching database operational exceptions in tools."""
+    with patch("agentic.tools.cultpass_db_tool.get_cultpass_engine", side_effect=Exception("Database connection lost")):
+        res = get_user_profile.invoke({"user_id_or_email": "a4ab87"})
+        assert "error" in res
+        assert "Database error" in res["error"]
