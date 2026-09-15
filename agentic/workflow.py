@@ -212,15 +212,28 @@ def specialist_router(state: AgentState) -> str:
             )
         return "tools"
     
-    # Update ticket status in Udahub DB to resolved and log final status
-    update_ticket_status.invoke({"ticket_id": ticket_id, "status": "resolved"})
-    log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "resolved"})
+    # Check if escalation tool was executed during conversation
+    has_escalated = False
+    for m in messages:
+        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "escalate_ticket":
+            has_escalated = True
+            break
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            if any(tc.get("name") == "escalate_ticket" for tc in m.tool_calls):
+                has_escalated = True
+                break
+                
+    final_status = "escalated" if has_escalated else "resolved"
+    update_ticket_status.invoke({"ticket_id": ticket_id, "status": final_status})
+    log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": final_status})
     return END
 
 def tool_router(state: AgentState) -> str:
-    """Routes tool response back to the appropriate agent or handles automatic escalation handoff."""
+    """Routes tool response back to originating specialist agent using explicit state['selected_agent'] or handles automatic escalation handoff."""
     messages = state.get("messages", [])
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
+    origin_agent = state.get("selected_agent") or "support_agent"
+    
     if not messages:
         return END
     last_msg = messages[-1]
@@ -259,7 +272,7 @@ def tool_router(state: AgentState) -> str:
                     outcome="success",
                     details={"content_preview": content_str[:200]}
                 )
-                return "support_agent"
+                return origin_agent
 
         # Log other tool outcomes
         outcome = "error" if "error" in content_str.lower() else "success"
@@ -271,12 +284,7 @@ def tool_router(state: AgentState) -> str:
             details={"content_preview": content_str[:200]}
         )
         
-        if tool_name in [t.name for t in support_tools]:
-            return "support_agent"
-        elif tool_name in [t.name for t in account_tools]:
-            return "account_agent"
-        elif tool_name in [t.name for t in ticket_tools]:
-            return "ticket_agent"
+        return origin_agent
             
     return "supervisor_router_node"
 

@@ -260,3 +260,33 @@ def test_workflow_memory_persistence():
         assert len(history) > 0
         messages = history[0].values["messages"]
         assert len(messages) >= 4
+
+def test_ticket_agent_escalation_preserves_escalated_status():
+    """Regression test verifying ticket_agent -> tools -> ticket_agent flow preserves escalated status."""
+    ticket_id = "test_escalate_preserves_status"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="Escalate my issue to human manager immediately")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "dispute", "urgency": "high"}
+    }
+    
+    esc_tool_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "escalate_ticket", "args": {"ticket_id": ticket_id, "reason": "Customer requested human manager"}, "id": "call_esc"}]
+    )
+    ack_msg = AIMessage(content="I have escalated your ticket to human support management.")
+    
+    res1 = ChatResult(generations=[ChatGeneration(message=esc_tool_call)])
+    res2 = ChatResult(generations=[ChatGeneration(message=ack_msg)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.side_effect = [res1, res2]
+        
+        result = orchestrator.invoke(input=input_data, config=config)
+        assert "messages" in result
+        
+        events = get_ticket_events(ticket_id)
+        res_events = [e for e in events if e.get("event_type") == "RESOLUTION"]
+        assert len(res_events) > 0
+        assert res_events[-1]["details"]["status"] == "escalated"
+
