@@ -203,6 +203,9 @@ def escalation_handoff_node(state: AgentState) -> Dict[str, Any]:
 def run_escalate_ticket(ticket_id: str, reason: str) -> Dict[str, Any]:
     return escalate_ticket.invoke({"ticket_id": ticket_id, "reason": reason})
 
+def run_update_ticket_status(ticket_id: str, status: str) -> Dict[str, Any]:
+    return update_ticket_status.invoke({"ticket_id": ticket_id, "status": status})
+
 # 6. Specialist & Tool Routers
 def specialist_router(state: AgentState) -> str:
     messages = state.get("messages", [])
@@ -247,8 +250,17 @@ def specialist_router(state: AgentState) -> str:
     else:
         final_status = "resolved"
         
-    update_ticket_status.invoke({"ticket_id": ticket_id, "status": final_status})
-    log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": final_status})
+    status_res = run_update_ticket_status(ticket_id, final_status)
+    status_str = str(status_res).lower()
+    if "error" in status_str:
+        log_event(
+            ticket_id=ticket_id,
+            event_type="RESOLUTION",
+            outcome="error",
+            details={"error": status_res.get("error") if isinstance(status_res, dict) else str(status_res), "intended_status": final_status}
+        )
+    else:
+        log_event(ticket_id=ticket_id, event_type="RESOLUTION", outcome="success", details={"status": final_status})
     return END
 
 def tool_router(state: AgentState) -> Any:

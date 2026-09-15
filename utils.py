@@ -69,7 +69,8 @@ def chat_interface(agent:CompiledStateGraph, ticket_id:str):
         if is_first_iteration:
             messages.append(HumanMessage(content=user_input))
         trigger = {
-            "messages": messages
+            "messages": messages,
+            "ticket_metadata": {"ticket_id": ticket_id, "tags": "support", "urgency": "normal"}
         }
         config = {
             "configurable": {

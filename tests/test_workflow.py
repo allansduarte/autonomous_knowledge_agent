@@ -407,4 +407,27 @@ def test_multi_tool_call_processing_logs_all_outcomes():
         assert "get_user_profile" in logged_tools
         assert "get_user_reservations" in logged_tools
 
+def test_failed_ticket_status_update_logs_resolution_error():
+    """Regression test verifying that when update_ticket_status returns an error, specialist_router logs RESOLUTION with outcome='error'."""
+    ticket_id = "test_failed_status_update"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="How do I cancel my subscription?")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "policy", "urgency": "normal"}
+    }
+    
+    final_ans = AIMessage(content="Cancellation details provided.")
+    res_mock = ChatResult(generations=[ChatGeneration(message=final_ans)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate", return_value=res_mock):
+        with patch("agentic.workflow.run_update_ticket_status", return_value={"error": "Database write lock failure"}):
+            result = orchestrator.invoke(input=input_data, config=config)
+            assert "messages" in result
+            
+            events = get_ticket_events(ticket_id)
+            res_events = [e for e in events if e.get("event_type") == "RESOLUTION"]
+            assert len(res_events) > 0
+            assert res_events[-1]["outcome"] == "error"
+
+
 
