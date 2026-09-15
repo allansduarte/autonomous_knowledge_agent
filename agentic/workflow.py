@@ -28,6 +28,7 @@ load_dotenv()
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     ticket_metadata: Optional[Dict[str, Any]]
+    selected_agent: Optional[str]
 
 # 2. Specialist Tools Registration
 support_tools = create_support_tools() + [escalate_ticket]
@@ -43,56 +44,123 @@ for t in support_tools + account_tools + ticket_tools:
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_KEY") or "sk-dummy-key-for-init"
 base_model = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
 
-supervisor_model = base_model.bind_tools(all_tools)
 support_model = base_model.bind_tools(support_tools)
 account_model = base_model.bind_tools(account_tools)
 ticket_model = base_model.bind_tools(ticket_tools)
 
-# 4. Ticket Classification Function
+# 4. Scored Multi-Feature Ticket Classification Function
 def classify_ticket(message_text: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Classifies incoming tickets based on content and metadata (urgency, tags, status, complexity).
-    Returns a dictionary containing selected_agent, category, urgency, and routing_reason.
+    """Classifies incoming tickets based on multi-feature scoring: content keywords, semantic intent, and metadata flags.
+    Returns a dictionary containing selected_agent, category, urgency, routing_reason, and component scores.
     """
     metadata = metadata or {}
     text_lower = (message_text or "").lower()
     tags = str(metadata.get("tags", "")).lower()
     urgency = str(metadata.get("urgency", "normal")).lower()
     status = str(metadata.get("status", "")).lower()
+    issue_type = str(metadata.get("issue_type", "")).lower()
     
-    # 1. Complex / High Urgency / Ticket Management Issues -> Ticket Agent
-    ticket_keywords = ["ticket", "status", "history", "log", "escalat", "issue_type", "dispute", "urgent", "human", "blocked account"]
-    if urgency in ["high", "urgent", "critical"] or any(k in tags for k in ["billing", "escalated", "dispute", "fraud"]) or any(k in text_lower for k in ticket_keywords):
-        return {
-            "selected_agent": "ticket_agent",
-            "category": "complex",
-            "urgency": "high" if urgency in ["high", "urgent", "critical"] or "dispute" in text_lower else "medium",
-            "routing_reason": "Routed to Ticket Agent due to high urgency, metadata tags, escalation request, or ticket history lookup requirement."
-        }
+    complex_score = 0.0
+    account_score = 0.0
+    policy_score = 0.0
     
-    # 2. Account / Profile / Quotas / Reservations -> Account Agent
-    account_keywords = ["profile", "reservation", "quota", "experience", "tier", "user_id", "subscription status", "my pass", "book", "event catalog"]
-    if any(k in tags for k in ["profile", "reservation", "account", "quota"]) or any(k in text_lower for k in account_keywords):
-        return {
-            "selected_agent": "account_agent",
-            "category": "account",
-            "urgency": "normal",
-            "routing_reason": "Routed to Account Agent due to account profile, reservation, tier, or experience search request."
-        }
+    # --- Metadata Evaluation ---
+    if urgency in ["high", "urgent", "critical"]:
+        complex_score += 4.0
+    if any(k in tags for k in ["billing", "escalated", "dispute", "fraud", "complaint"]):
+        complex_score += 3.5
+    if issue_type in ["billing_dispute", "account_takeover", "escalation"]:
+        complex_score += 4.0
+    if status in ["escalated", "blocked"]:
+        complex_score += 3.0
         
-    # 3. Default: Policy / FAQ / How-To / General Questions -> Support Agent
+    if any(k in tags for k in ["profile", "reservation", "account", "quota", "pass"]):
+        account_score += 3.0
+    if any(k in tags for k in ["cancellation", "policy", "faq", "rules", "refund"]):
+        policy_score += 3.0
+
+    # --- Text Content Keyword & Intent Evaluation ---
+    ticket_keywords = ["ticket", "status", "history", "log", "escalat", "dispute", "urgent", "human", "blocked account", "charge", "manager", "unrecognized"]
+    account_keywords = ["profile", "reservation", "quota", "experience", "tier", "user_id", "subscription status", "my pass", "book", "event catalog"]
+    policy_keywords = ["cancel", "pause", "policy", "faq", "rules", "how do i", "how to", "terms", "condition", "refund policy"]
+    
+    for kw in ticket_keywords:
+        if kw in text_lower:
+            complex_score += 2.0
+    for kw in account_keywords:
+        if kw in text_lower:
+            account_score += 2.0
+    for kw in policy_keywords:
+        if kw in text_lower:
+            policy_score += 2.0
+            
+    # Default baseline score for policy lookup
+    policy_score += 1.0
+
+    # Score comparison and selected destination determination
+    if complex_score > account_score and complex_score > policy_score:
+        selected = "ticket_agent"
+        category = "complex"
+        calc_urgency = "high" if urgency in ["high", "urgent", "critical"] or complex_score >= 4.0 else "medium"
+        reason = f"Routed to Ticket Agent based on high complex/escalation score ({complex_score:.1f}) driven by urgency, metadata, or dispute keywords."
+    elif account_score >= policy_score:
+        selected = "account_agent"
+        category = "account"
+        calc_urgency = "normal"
+        reason = f"Routed to Account Agent based on account/reservation query score ({account_score:.1f})."
+    else:
+        selected = "support_agent"
+        category = "policy"
+        calc_urgency = "normal"
+        reason = f"Routed to Knowledge Support Agent based on policy/FAQ score ({policy_score:.1f})."
+
     return {
-        "selected_agent": "support_agent",
-        "category": "policy",
-        "urgency": "normal",
-        "routing_reason": "Routed to Knowledge Support Agent for grounded policy FAQ and general knowledge lookup."
+        "selected_agent": selected,
+        "category": category,
+        "urgency": calc_urgency,
+        "routing_reason": reason,
+        "scores": {
+            "complex": complex_score,
+            "account": account_score,
+            "policy": policy_score
+        }
     }
 
 # 5. Agent Executable Node Functions
-def supervisor_agent_node(state: AgentState):
-    """Supervisor Agent Node: entry point that logs execution."""
+def supervisor_router_node(state: AgentState) -> Dict[str, Any]:
+    """Dedicated Supervisor Router Node at graph START.
+    Runs ticket classification BEFORE model execution, logs routing decisions, and sets selected_agent state.
+    """
+    messages = state.get("messages", [])
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
-    log_event(ticket_id=ticket_id, event_type="AGENT_EXECUTION", agent_name="supervisor_agent")
-    return {}
+    
+    user_text = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            user_text = m.content
+            break
+            
+    metadata = state.get("ticket_metadata", {})
+    classification = classify_ticket(user_text, metadata)
+    
+    log_event(
+        ticket_id=ticket_id,
+        event_type="CLASSIFICATION",
+        agent_name="supervisor_router_node",
+        details=classification
+    )
+    log_event(
+        ticket_id=ticket_id,
+        event_type="ROUTING",
+        agent_name="supervisor_router_node",
+        details={"destination": classification["selected_agent"], "reason": classification["routing_reason"]}
+    )
+    
+    return {"selected_agent": classification["selected_agent"]}
+
+def dispatch_specialist(state: AgentState) -> str:
+    """Conditional edge from supervisor_router_node to target specialist agent node."""
+    return state.get("selected_agent") or "support_agent"
 
 def support_agent_node(state: AgentState):
     """Support Specialist Agent: executes KB search and policy inquiries using get_support_agent_prompt()."""
@@ -127,39 +195,7 @@ def ticket_agent_node(state: AgentState):
     response = ticket_model.invoke(clean_messages)
     return {"messages": [response]}
 
-# 6. Routing Functions
-def supervisor_router(state: AgentState) -> str:
-    messages = state.get("messages", [])
-    if not messages:
-        return END
-    
-    ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
-    
-    # Extract latest human message and state metadata for classification
-    user_text = ""
-    for m in reversed(messages):
-        if isinstance(m, HumanMessage):
-            user_text = m.content
-            break
-            
-    metadata = state.get("ticket_metadata", {})
-    classification = classify_ticket(user_text, metadata)
-    
-    log_event(
-        ticket_id=ticket_id,
-        event_type="CLASSIFICATION",
-        agent_name="supervisor_agent",
-        details=classification
-    )
-    log_event(
-        ticket_id=ticket_id,
-        event_type="ROUTING",
-        agent_name="supervisor_agent",
-        details={"destination": classification["selected_agent"], "reason": classification["routing_reason"]}
-    )
-    
-    return classification["selected_agent"]
-
+# 6. Specialist & Tool Routers
 def specialist_router(state: AgentState) -> str:
     messages = state.get("messages", [])
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
@@ -242,29 +278,27 @@ def tool_router(state: AgentState) -> str:
         elif tool_name in [t.name for t in ticket_tools]:
             return "ticket_agent"
             
-    return "supervisor_agent"
+    return "supervisor_router_node"
 
 # 7. Build Multi-Agent StateGraph
 builder = StateGraph(AgentState)
 
-# Add 4 Specialized Executable Nodes + ToolNode
-builder.add_node("supervisor_agent", supervisor_agent_node)
+# Add Executable Router & Specialist Nodes + ToolNode
+builder.add_node("supervisor_router_node", supervisor_router_node)
 builder.add_node("support_agent", support_agent_node)
 builder.add_node("account_agent", account_agent_node)
 builder.add_node("ticket_agent", ticket_agent_node)
 builder.add_node("tools", ToolNode(all_tools))
 
-# Add Edges
-builder.add_edge(START, "supervisor_agent")
+# Add Graph Edges
+builder.add_edge(START, "supervisor_router_node")
 builder.add_conditional_edges(
-    "supervisor_agent",
-    supervisor_router,
+    "supervisor_router_node",
+    dispatch_specialist,
     {
         "support_agent": "support_agent",
         "account_agent": "account_agent",
         "ticket_agent": "ticket_agent",
-        "tools": "tools",
-        END: END,
     }
 )
 builder.add_conditional_edges(
@@ -298,7 +332,7 @@ builder.add_conditional_edges(
         "support_agent": "support_agent",
         "account_agent": "account_agent",
         "ticket_agent": "ticket_agent",
-        "supervisor_agent": "supervisor_agent",
+        "supervisor_router_node": "supervisor_router_node",
         END: END,
     }
 )
