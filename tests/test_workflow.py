@@ -128,7 +128,7 @@ def test_graph_stream_node_visitation_account():
 
 def test_scenario1_policy_faq_orchestrator_invoke():
     """Scenario 1: End-to-end Policy FAQ query processing via orchestrator.invoke."""
-    ticket_id = "ticket_a4ab87"
+    ticket_id = "ticket_f556c0"
     config = {"configurable": {"thread_id": ticket_id}}
     input_data = {
         "messages": [HumanMessage(content="How do I cancel or pause my CultPass subscription?")],
@@ -162,7 +162,7 @@ def test_scenario1_policy_faq_orchestrator_invoke():
 
 def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
     """Scenario 2: End-to-end low confidence query -> should_escalate -> automatic escalation via orchestrator.invoke."""
-    ticket_id = "ticket_a4ab87"
+    ticket_id = "ticket_88382b"
     config = {"configurable": {"thread_id": ticket_id}}
     input_data = {
         "messages": [HumanMessage(content="xyz123999 unknown quantum feature")],
@@ -179,6 +179,8 @@ def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
         result = orchestrator.invoke(input=input_data, config=config)
         assert "messages" in result
         assert len(result["messages"]) > 0
+        last_response = result["messages"][-1].content
+        assert "escalated to human support" in last_response.lower()
         
         events = get_ticket_events(ticket_id)
         event_types = [e["event_type"] for e in events]
@@ -190,7 +192,7 @@ def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
 
 def test_scenario3_account_services_orchestrator_invoke():
     """Scenario 3: End-to-end user profile & reservation query processing via orchestrator.invoke."""
-    ticket_id = "ticket_a4ab87"
+    ticket_id = "ticket_888fb2"
     config = {"configurable": {"thread_id": ticket_id}}
     input_data = {
         "messages": [HumanMessage(content="What is my pass quota and reservations for user a4ab87?")],
@@ -221,7 +223,7 @@ def test_scenario3_account_services_orchestrator_invoke():
 
 def test_scenario4_edge_case_error_handling_orchestrator_invoke():
     """Scenario 4: End-to-end unknown user lookup via orchestrator.invoke."""
-    ticket_id = "ticket_a4ab87"
+    ticket_id = "ticket_f1f10d"
     config = {"configurable": {"thread_id": ticket_id}}
     input_data = {
         "messages": [HumanMessage(content="Look up reservations for nonexistent_user_xyz999")],
@@ -338,7 +340,38 @@ def test_failed_escalation_does_not_mark_ticket_escalated():
         
         res_events = [e for e in events if e.get("event_type") == "RESOLUTION"]
         assert len(res_events) > 0
-        assert res_events[-1]["details"]["status"] == "resolved"
+        assert res_events[-1]["details"]["status"] == "open"
+
+def test_failed_automatic_escalation_leaves_ticket_open():
+    """Regression test verifying that when automatic escalation fails (DB error), ticket remains 'open' and error is logged."""
+    ticket_id = "test_failed_auto_esc"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="xyz123999 unknown quantum feature")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "policy", "urgency": "normal"}
+    }
+    
+    tool_call_msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_knowledge_base", "args": {"query": "xyz123999 unknown quantum feature"}, "id": "call_2"}]
+    )
+    
+    res1 = ChatResult(generations=[ChatGeneration(message=tool_call_msg)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.return_value = res1
+        with patch("agentic.workflow.run_escalate_ticket", return_value={"error": "Database error during auto escalation"}):
+            result = orchestrator.invoke(input=input_data, config=config)
+            assert "messages" in result
+            
+            events = get_ticket_events(ticket_id)
+            esc_events = [e for e in events if e.get("event_type") == "ESCALATION"]
+            assert len(esc_events) > 0
+            assert esc_events[-1]["outcome"] == "error"
+            
+            res_events = [e for e in events if e.get("event_type") == "RESOLUTION"]
+            assert len(res_events) > 0
+            assert res_events[-1]["details"]["status"] == "open"
 
 def test_multi_tool_call_processing_logs_all_outcomes():
     """Regression test verifying tool_router processes and logs ALL ToolMessage items in a multi-tool call turn."""

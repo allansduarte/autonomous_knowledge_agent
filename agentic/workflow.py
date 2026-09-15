@@ -195,6 +195,14 @@ def ticket_agent_node(state: AgentState):
     response = ticket_model.invoke(clean_messages)
     return {"messages": [response]}
 
+def escalation_handoff_node(state: AgentState) -> Dict[str, Any]:
+    """Executable graph node that appends the customer-facing escalation handoff response message into conversation state."""
+    handoff_msg = AIMessage(content="Ticket has been escalated to human support management due to low knowledge retrieval confidence.")
+    return {"messages": [handoff_msg]}
+
+def run_escalate_ticket(ticket_id: str, reason: str) -> Dict[str, Any]:
+    return escalate_ticket.invoke({"ticket_id": ticket_id, "reason": reason})
+
 # 6. Specialist & Tool Routers
 def specialist_router(state: AgentState) -> str:
     messages = state.get("messages", [])
@@ -212,16 +220,33 @@ def specialist_router(state: AgentState) -> str:
             )
         return "tools"
     
-    # Check if escalation tool was successfully executed during conversation (ignoring failed calls)
+    # Check status of escalate_ticket tool calls in message history or logged events
     has_escalated = False
+    has_failed_escalation = False
     for m in messages:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "escalate_ticket":
             content_str = str(m.content).lower()
-            if "error" not in content_str and '"success": true' in content_str or "'success': true" in content_str:
+            if "error" not in content_str and ('"success": true' in content_str or "'success': true" in content_str):
                 has_escalated = True
-                break
+            elif "error" in content_str:
+                has_failed_escalation = True
                 
-    final_status = "escalated" if has_escalated else "resolved"
+    # Check ticket event logs for auto-escalation failure
+    from agentic.logger import get_ticket_events
+    events = get_ticket_events(ticket_id)
+    for e in events:
+        if e.get("event_type") == "ESCALATION" and e.get("outcome") == "error":
+            has_failed_escalation = True
+        elif e.get("event_type") == "ESCALATION" and e.get("outcome") == "escalated":
+            has_escalated = True
+            
+    if has_escalated:
+        final_status = "escalated"
+    elif has_failed_escalation:
+        final_status = "open"
+    else:
+        final_status = "resolved"
+        
     update_ticket_status.invoke({"ticket_id": ticket_id, "status": final_status})
     log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": final_status})
     return END
@@ -304,40 +329,47 @@ def tool_router(state: AgentState) -> Any:
             )
             
     if should_auto_escalate:
-        esc_res = escalate_ticket.invoke({
-            "ticket_id": ticket_id,
-            "reason": "Low knowledge confidence score (no matching article found above threshold)."
-        })
+        esc_res = run_escalate_ticket(ticket_id, "Low knowledge confidence score (no matching article found above threshold).")
         esc_str = str(esc_res).lower()
-        esc_outcome = "error" if "error" in esc_str else "escalated"
-        
-        log_event(
-            ticket_id=ticket_id,
-            event_type="ESCALATION",
-            tool_name="escalate_ticket",
-            outcome=esc_outcome,
-            details=esc_res if isinstance(esc_res, dict) else {"result": esc_res}
-        )
-        
-        handoff_msg = AIMessage(content="Ticket has been escalated to human support management due to low knowledge retrieval confidence.")
-        update_ticket_status.invoke({"ticket_id": ticket_id, "status": "escalated"})
-        log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "escalated"})
-        return END
+        if "error" in esc_str:
+            log_event(
+                ticket_id=ticket_id,
+                event_type="ESCALATION",
+                tool_name="escalate_ticket",
+                outcome="error",
+                details=esc_res if isinstance(esc_res, dict) else {"result": esc_res}
+            )
+            update_ticket_status.invoke({"ticket_id": ticket_id, "status": "open"})
+            log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "open"})
+            return origin_agent
+        else:
+            log_event(
+                ticket_id=ticket_id,
+                event_type="ESCALATION",
+                tool_name="escalate_ticket",
+                outcome="escalated",
+                details=esc_res if isinstance(esc_res, dict) else {"result": esc_res}
+            )
+            update_ticket_status.invoke({"ticket_id": ticket_id, "status": "escalated"})
+            log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "escalated"})
+            return "escalation_handoff_node"
 
     return origin_agent
 
 # 7. Build Multi-Agent StateGraph
 builder = StateGraph(AgentState)
 
-# Add Executable Router & Specialist Nodes + ToolNode
+# Add Executable Router, Specialist & Handoff Nodes + ToolNode
 builder.add_node("supervisor_router_node", supervisor_router_node)
 builder.add_node("support_agent", support_agent_node)
 builder.add_node("account_agent", account_agent_node)
 builder.add_node("ticket_agent", ticket_agent_node)
+builder.add_node("escalation_handoff_node", escalation_handoff_node)
 builder.add_node("tools", ToolNode(all_tools))
 
 # Add Graph Edges
 builder.add_edge(START, "supervisor_router_node")
+builder.add_edge("escalation_handoff_node", END)
 builder.add_conditional_edges(
     "supervisor_router_node",
     dispatch_specialist,
@@ -379,6 +411,7 @@ builder.add_conditional_edges(
         "account_agent": "account_agent",
         "ticket_agent": "ticket_agent",
         "supervisor_router_node": "supervisor_router_node",
+        "escalation_handoff_node": "escalation_handoff_node",
         END: END,
     }
 )
