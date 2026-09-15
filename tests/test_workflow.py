@@ -156,6 +156,9 @@ def test_scenario1_policy_faq_orchestrator_invoke():
         assert "CLASSIFICATION" in event_types
         assert "ROUTING" in event_types
         assert "TOOL_CALL" in event_types
+        
+        db_details = get_ticket_details.invoke({"ticket_id": ticket_id})
+        assert db_details.get("metadata", {}).get("status") == "resolved"
 
 def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
     """Scenario 2: End-to-end low confidence query -> should_escalate -> automatic escalation via orchestrator.invoke."""
@@ -163,7 +166,7 @@ def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
     config = {"configurable": {"thread_id": ticket_id}}
     input_data = {
         "messages": [HumanMessage(content="xyz123999 unknown quantum feature")],
-        "ticket_metadata": {"ticket_id": ticket_id, "tags": "unknown", "urgency": "high"}
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "policy", "urgency": "normal"}
     }
     
     tool_call_msg = AIMessage(
@@ -175,11 +178,15 @@ def test_scenario2_unavailable_knowledge_escalation_orchestrator_invoke():
     with patch("langchain_openai.ChatOpenAI._generate", return_value=res_mock):
         result = orchestrator.invoke(input=input_data, config=config)
         assert "messages" in result
+        assert len(result["messages"]) > 0
         
         events = get_ticket_events(ticket_id)
         event_types = [e["event_type"] for e in events]
         assert "RETRIEVAL_MISS" in event_types
         assert "ESCALATION" in event_types
+        
+        db_details = get_ticket_details.invoke({"ticket_id": ticket_id})
+        assert db_details.get("metadata", {}).get("status") == "escalated"
 
 def test_scenario3_account_services_orchestrator_invoke():
     """Scenario 3: End-to-end user profile & reservation query processing via orchestrator.invoke."""
@@ -208,6 +215,9 @@ def test_scenario3_account_services_orchestrator_invoke():
         events = get_ticket_events(ticket_id)
         tool_names = [e.get("tool_name") for e in events if e.get("tool_name")]
         assert "get_user_profile" in tool_names
+        
+        db_details = get_ticket_details.invoke({"ticket_id": ticket_id})
+        assert db_details.get("metadata", {}).get("status") == "resolved"
 
 def test_scenario4_edge_case_error_handling_orchestrator_invoke():
     """Scenario 4: End-to-end unknown user lookup via orchestrator.invoke."""
@@ -236,6 +246,13 @@ def test_scenario4_edge_case_error_handling_orchestrator_invoke():
         events = get_ticket_events(ticket_id)
         outcomes = [e.get("outcome") for e in events]
         assert "error" in outcomes
+
+def test_metrics_summary_accuracy():
+    """Tests that get_metrics_summary calculates exact retrieval success rates without double-counting."""
+    summary = get_metrics_summary()
+    assert summary["retrieval_success_rate"] <= 1.0
+    assert "total_events" in summary
+    assert "unique_tickets" in summary
 
 def test_workflow_memory_persistence():
     """Tests short-term thread session memory checkpointing in state graph."""

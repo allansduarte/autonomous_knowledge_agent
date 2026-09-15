@@ -216,8 +216,10 @@ def specialist_router(state: AgentState) -> str:
     has_escalated = False
     for m in messages:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "escalate_ticket":
-            has_escalated = True
-            break
+            content_str = str(m.content).lower()
+            if "error" not in content_str:
+                has_escalated = True
+                break
         if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
             if any(tc.get("name") == "escalate_ticket" for tc in m.tool_calls):
                 has_escalated = True
@@ -228,7 +230,7 @@ def specialist_router(state: AgentState) -> str:
     log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": final_status})
     return END
 
-def tool_router(state: AgentState) -> str:
+def tool_router(state: AgentState) -> Any:
     """Routes tool response back to originating specialist agent using explicit state['selected_agent'] or handles automatic escalation handoff."""
     messages = state.get("messages", [])
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
@@ -240,10 +242,20 @@ def tool_router(state: AgentState) -> str:
     if isinstance(last_msg, ToolMessage):
         tool_name = getattr(last_msg, "name", "") or ""
         content_str = str(last_msg.content)
+        content_lower = content_str.lower()
         
         # Check for RAG knowledge retrieval outcomes
         if tool_name == "search_knowledge_base":
-            if '"should_escalate": true' in content_str.lower() or "'should_escalate': true" in content_str.lower():
+            if "error" in content_lower or "operationalerror" in content_lower:
+                log_event(
+                    ticket_id=ticket_id,
+                    event_type="RETRIEVAL_ERROR",
+                    tool_name=tool_name,
+                    outcome="error",
+                    details={"error": content_str[:200]}
+                )
+                return origin_agent
+            elif '"should_escalate": true' in content_lower or "'should_escalate': true" in content_lower:
                 log_event(
                     ticket_id=ticket_id,
                     event_type="RETRIEVAL_MISS",
@@ -256,13 +268,20 @@ def tool_router(state: AgentState) -> str:
                     "ticket_id": ticket_id,
                     "reason": "Low knowledge confidence score (no matching article found above threshold)."
                 })
+                esc_str = str(esc_res).lower()
+                esc_outcome = "error" if "error" in esc_str else "escalated"
+                
                 log_event(
                     ticket_id=ticket_id,
                     event_type="ESCALATION",
                     tool_name="escalate_ticket",
-                    outcome="escalated",
-                    details=esc_res
+                    outcome=esc_outcome,
+                    details=esc_res if isinstance(esc_res, dict) else {"result": esc_res}
                 )
+                
+                handoff_msg = AIMessage(content="Ticket has been escalated to human support management due to low knowledge retrieval confidence.")
+                update_ticket_status.invoke({"ticket_id": ticket_id, "status": "escalated"})
+                log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "escalated"})
                 return END
             else:
                 log_event(
@@ -275,14 +294,24 @@ def tool_router(state: AgentState) -> str:
                 return origin_agent
 
         # Log other tool outcomes
-        outcome = "error" if "error" in content_str.lower() else "success"
-        log_event(
-            ticket_id=ticket_id,
-            event_type="TOOL_RESULT",
-            tool_name=tool_name,
-            outcome=outcome,
-            details={"content_preview": content_str[:200]}
-        )
+        if tool_name == "escalate_ticket":
+            outcome = "error" if "error" in content_lower else "escalated"
+            log_event(
+                ticket_id=ticket_id,
+                event_type="ESCALATION",
+                tool_name=tool_name,
+                outcome=outcome,
+                details={"content_preview": content_str[:200]}
+            )
+        else:
+            outcome = "error" if "error" in content_lower else "success"
+            log_event(
+                ticket_id=ticket_id,
+                event_type="TOOL_RESULT",
+                tool_name=tool_name,
+                outcome=outcome,
+                details={"content_preview": content_str[:200]}
+            )
         
         return origin_agent
             

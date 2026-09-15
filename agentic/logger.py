@@ -65,16 +65,21 @@ def get_metrics_summary() -> Dict[str, Any]:
     
     tool_calls = [e for e in _EVENT_LOGS if e["event_type"] == "TOOL_CALL"]
     retrieval_calls = [e for e in tool_calls if e.get("tool_name") == "search_knowledge_base"]
-    retrieval_successes = [e for e in _EVENT_LOGS if e.get("event_type") == "RETRIEVAL_SUCCESS" or (e.get("tool_name") == "search_knowledge_base" and e.get("outcome") == "success")]
-    retrieval_misses = [e for e in _EVENT_LOGS if e.get("event_type") == "RETRIEVAL_MISS" or (e.get("tool_name") == "search_knowledge_base" and e.get("outcome") == "miss")]
+    retrieval_successes = [e for e in _EVENT_LOGS if e.get("event_type") == "RETRIEVAL_SUCCESS"]
+    retrieval_misses = [e for e in _EVENT_LOGS if e.get("event_type") == "RETRIEVAL_MISS"]
+    retrieval_errors = [e for e in _EVENT_LOGS if e.get("event_type") == "RETRIEVAL_ERROR"]
     
-    escalations = [e for e in _EVENT_LOGS if e.get("event_type") == "ESCALATION" or e.get("tool_name") == "escalate_ticket"]
+    escalations = [e for e in _EVENT_LOGS if e.get("event_type") == "ESCALATION" and e.get("outcome") != "error"]
     
     tool_usage_counts = {}
     for tc in tool_calls:
         tname = tc.get("tool_name", "unknown")
         tool_usage_counts[tname] = tool_usage_counts.get(tname, 0) + 1
         
+    for e in _EVENT_LOGS:
+        if e.get("event_type") == "ESCALATION" and "escalate_ticket" not in tool_usage_counts:
+            tool_usage_counts["escalate_ticket"] = len(escalations)
+            
     return {
         "total_events": total_events,
         "unique_tickets": len(ticket_ids),
@@ -82,6 +87,7 @@ def get_metrics_summary() -> Dict[str, Any]:
         "retrieval_calls": len(retrieval_calls),
         "retrieval_successes": len(retrieval_successes),
         "retrieval_misses": len(retrieval_misses),
+        "retrieval_errors": len(retrieval_errors),
         "retrieval_success_rate": (len(retrieval_successes) / len(retrieval_calls)) if retrieval_calls else 1.0,
         "escalation_count": len(escalations),
         "tool_usage_counts": tool_usage_counts
