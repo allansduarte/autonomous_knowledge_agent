@@ -279,7 +279,7 @@ def test_workflow_memory_persistence():
         assert len(messages) >= 4
 
 def test_ticket_agent_escalation_preserves_escalated_status():
-    """Regression test verifying ticket_agent -> tools -> ticket_agent flow preserves escalated status."""
+    """Regression test verifying ticket_agent -> tools -> ticket_agent flow preserves escalated status when successful."""
     ticket_id = "test_escalate_preserves_status"
     config = {"configurable": {"thread_id": ticket_id}}
     input_data = {
@@ -306,4 +306,72 @@ def test_ticket_agent_escalation_preserves_escalated_status():
         res_events = [e for e in events if e.get("event_type") == "RESOLUTION"]
         assert len(res_events) > 0
         assert res_events[-1]["details"]["status"] == "escalated"
+
+def test_failed_escalation_does_not_mark_ticket_escalated():
+    """Regression test verifying that a failed escalation tool call logs outcome 'error' and does not mark ticket escalated."""
+    ticket_id = "test_failed_escalation"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="Escalate my issue immediately")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "dispute", "urgency": "high"}
+    }
+    
+    esc_tool_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "escalate_ticket", "args": {"ticket_id": "", "reason": "invalid_empty_id"}, "id": "call_failed"}]
+    )
+    ack_msg = AIMessage(content="Could not escalate ticket due to invalid ID.")
+    
+    res1 = ChatResult(generations=[ChatGeneration(message=esc_tool_call)])
+    res2 = ChatResult(generations=[ChatGeneration(message=ack_msg)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.side_effect = [res1, res2]
+        
+        result = orchestrator.invoke(input=input_data, config=config)
+        assert "messages" in result
+        
+        events = get_ticket_events(ticket_id)
+        esc_events = [e for e in events if e.get("event_type") == "ESCALATION"]
+        assert len(esc_events) > 0
+        assert esc_events[-1]["outcome"] == "error"
+        
+        res_events = [e for e in events if e.get("event_type") == "RESOLUTION"]
+        assert len(res_events) > 0
+        assert res_events[-1]["details"]["status"] == "resolved"
+
+def test_multi_tool_call_processing_logs_all_outcomes():
+    """Regression test verifying tool_router processes and logs ALL ToolMessage items in a multi-tool call turn."""
+    ticket_id = "test_multi_tool"
+    config = {"configurable": {"thread_id": ticket_id}}
+    input_data = {
+        "messages": [HumanMessage(content="Get my profile and my reservations for user a4ab87")],
+        "ticket_metadata": {"ticket_id": ticket_id, "tags": "profile", "urgency": "normal"}
+    }
+    
+    multi_tool_call = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "get_user_profile", "args": {"user_id_or_email": "a4ab87"}, "id": "m1"},
+            {"name": "get_user_reservations", "args": {"user_id": "a4ab87"}, "id": "m2"}
+        ]
+    )
+    final_ans = AIMessage(content="Retrieved profile and reservations successfully.")
+    
+    res1 = ChatResult(generations=[ChatGeneration(message=multi_tool_call)])
+    res2 = ChatResult(generations=[ChatGeneration(message=final_ans)])
+    
+    with patch("langchain_openai.ChatOpenAI._generate") as mock_gen:
+        mock_gen.side_effect = [res1, res2]
+        
+        result = orchestrator.invoke(input=input_data, config=config)
+        assert "messages" in result
+        
+        events = get_ticket_events(ticket_id)
+        tool_results = [e for e in events if e.get("event_type") == "TOOL_RESULT"]
+        logged_tools = [e.get("tool_name") for e in tool_results]
+        
+        assert "get_user_profile" in logged_tools
+        assert "get_user_reservations" in logged_tools
+
 

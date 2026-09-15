@@ -212,16 +212,12 @@ def specialist_router(state: AgentState) -> str:
             )
         return "tools"
     
-    # Check if escalation tool was executed during conversation
+    # Check if escalation tool was successfully executed during conversation (ignoring failed calls)
     has_escalated = False
     for m in messages:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "escalate_ticket":
             content_str = str(m.content).lower()
-            if "error" not in content_str:
-                has_escalated = True
-                break
-        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-            if any(tc.get("name") == "escalate_ticket" for tc in m.tool_calls):
+            if "error" not in content_str and '"success": true' in content_str or "'success': true" in content_str:
                 has_escalated = True
                 break
                 
@@ -231,17 +227,33 @@ def specialist_router(state: AgentState) -> str:
     return END
 
 def tool_router(state: AgentState) -> Any:
-    """Routes tool response back to originating specialist agent using explicit state['selected_agent'] or handles automatic escalation handoff."""
+    """Routes tool response back to originating specialist agent using explicit state['selected_agent'] or handles automatic escalation handoff.
+    Processes ALL consecutive ToolMessage outputs returned in the current turn.
+    """
     messages = state.get("messages", [])
     ticket_id = state.get("ticket_metadata", {}).get("ticket_id", "default_thread")
     origin_agent = state.get("selected_agent") or "support_agent"
     
     if not messages:
         return END
-    last_msg = messages[-1]
-    if isinstance(last_msg, ToolMessage):
-        tool_name = getattr(last_msg, "name", "") or ""
-        content_str = str(last_msg.content)
+        
+    # Gather all consecutive ToolMessage items at the tail of messages
+    tool_msgs = []
+    for m in reversed(messages):
+        if isinstance(m, ToolMessage):
+            tool_msgs.append(m)
+        else:
+            break
+    tool_msgs.reverse()
+    
+    if not tool_msgs:
+        return "supervisor_router_node"
+        
+    should_auto_escalate = False
+    
+    for tm in tool_msgs:
+        tool_name = getattr(tm, "name", "") or ""
+        content_str = str(tm.content)
         content_lower = content_str.lower()
         
         # Check for RAG knowledge retrieval outcomes
@@ -254,7 +266,6 @@ def tool_router(state: AgentState) -> Any:
                     outcome="error",
                     details={"error": content_str[:200]}
                 )
-                return origin_agent
             elif '"should_escalate": true' in content_lower or "'should_escalate': true" in content_lower:
                 log_event(
                     ticket_id=ticket_id,
@@ -263,26 +274,7 @@ def tool_router(state: AgentState) -> Any:
                     outcome="miss",
                     details={"reason": "Low knowledge confidence score."}
                 )
-                # Automatic Escalation Handoff
-                esc_res = escalate_ticket.invoke({
-                    "ticket_id": ticket_id,
-                    "reason": "Low knowledge confidence score (no matching article found above threshold)."
-                })
-                esc_str = str(esc_res).lower()
-                esc_outcome = "error" if "error" in esc_str else "escalated"
-                
-                log_event(
-                    ticket_id=ticket_id,
-                    event_type="ESCALATION",
-                    tool_name="escalate_ticket",
-                    outcome=esc_outcome,
-                    details=esc_res if isinstance(esc_res, dict) else {"result": esc_res}
-                )
-                
-                handoff_msg = AIMessage(content="Ticket has been escalated to human support management due to low knowledge retrieval confidence.")
-                update_ticket_status.invoke({"ticket_id": ticket_id, "status": "escalated"})
-                log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "escalated"})
-                return END
+                should_auto_escalate = True
             else:
                 log_event(
                     ticket_id=ticket_id,
@@ -291,10 +283,8 @@ def tool_router(state: AgentState) -> Any:
                     outcome="success",
                     details={"content_preview": content_str[:200]}
                 )
-                return origin_agent
-
         # Log other tool outcomes
-        if tool_name == "escalate_ticket":
+        elif tool_name == "escalate_ticket":
             outcome = "error" if "error" in content_lower else "escalated"
             log_event(
                 ticket_id=ticket_id,
@@ -312,10 +302,29 @@ def tool_router(state: AgentState) -> Any:
                 outcome=outcome,
                 details={"content_preview": content_str[:200]}
             )
-        
-        return origin_agent
             
-    return "supervisor_router_node"
+    if should_auto_escalate:
+        esc_res = escalate_ticket.invoke({
+            "ticket_id": ticket_id,
+            "reason": "Low knowledge confidence score (no matching article found above threshold)."
+        })
+        esc_str = str(esc_res).lower()
+        esc_outcome = "error" if "error" in esc_str else "escalated"
+        
+        log_event(
+            ticket_id=ticket_id,
+            event_type="ESCALATION",
+            tool_name="escalate_ticket",
+            outcome=esc_outcome,
+            details=esc_res if isinstance(esc_res, dict) else {"result": esc_res}
+        )
+        
+        handoff_msg = AIMessage(content="Ticket has been escalated to human support management due to low knowledge retrieval confidence.")
+        update_ticket_status.invoke({"ticket_id": ticket_id, "status": "escalated"})
+        log_event(ticket_id=ticket_id, event_type="RESOLUTION", details={"status": "escalated"})
+        return END
+
+    return origin_agent
 
 # 7. Build Multi-Agent StateGraph
 builder = StateGraph(AgentState)
